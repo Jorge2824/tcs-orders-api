@@ -1,0 +1,6 @@
+export enum AuditEvent {
+  ORDER_CREATED = 1,
+  ORDER_PROCESSING = 2,
+  ORDER_COMPLETED = 3,
+  ORDER_FAILED = 4,
+}

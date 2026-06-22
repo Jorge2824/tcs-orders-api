@@ -1,0 +1,312 @@
+openapi: '3.0.3'
+info:
+  title: TCS Orders API
+  description: |
+    Plataforma de procesamiento de órdenes para comercios digitales.
+
+    **Autenticación:** Todos los endpoints requieren un Bearer token en el encabezado `Authorization`.
+
+    Token local: `dev-secret-token`
+  version: '1.0.0'
+  contact:
+    name: Prueba Técnica TCS
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Entorno local Docker
+
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: 'Token definido en la variable de entorno BEARER_TOKEN. Por defecto: dev-secret-token'
+
+  schemas:
+    OrderStatus:
+      type: integer
+      enum: [1, 2, 3, 4]
+      description: |
+        Estado numérico de la orden:
+        - `1` PENDING: orden registrada, pendiente de procesamiento
+        - `2` PROCESSING: en proceso de aprobación
+        - `3` COMPLETED: orden aprobada y completada
+        - `4` FAILED: procesamiento fallido
+
+    Currency:
+      type: string
+      enum: [PEN, USD]
+      description: |
+        Moneda de la transacción:
+        - `PEN`: Soles peruanos
+        - `USD`: Dólares americanos
+
+    AuditEvent:
+      type: integer
+      enum: [1, 2, 3, 4]
+      description: |
+        Evento de auditoría (valor numérico):
+        - `1` ORDER_CREATED
+        - `2` ORDER_PROCESSING
+        - `3` ORDER_COMPLETED
+        - `4` ORDER_FAILED
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: '550e8400-e29b-41d4-a716-446655440000'
+        customerId:
+          type: string
+          example: 'cliente-123'
+        amount:
+          type: number
+          format: float
+          example: 199.99
+        currency:
+          $ref: '#/components/schemas/Currency'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    AuditLog:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderId:
+          type: string
+          format: uuid
+        event:
+          $ref: '#/components/schemas/AuditEvent'
+        previousStatus:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/OrderStatus'
+        newStatus:
+          $ref: '#/components/schemas/OrderStatus'
+        timestamp:
+          type: string
+          format: date-time
+
+    OrderWithAudit:
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          properties:
+            auditLogs:
+              type: array
+              items:
+                $ref: '#/components/schemas/AuditLog'
+
+    CreateOrderRequest:
+      type: object
+      required:
+        - customerId
+        - amount
+        - currency
+      properties:
+        customerId:
+          type: string
+          minLength: 1
+          example: 'cliente-123'
+        amount:
+          type: number
+          minimum: 0.01
+          example: 199.99
+        currency:
+          $ref: '#/components/schemas/Currency'
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+          example: 'Descripción del error'
+
+paths:
+  /orders:
+    post:
+      summary: Crear una nueva orden
+      description: |
+        Crea una orden con estado `PENDING` y la encola automáticamente en SQS
+        para procesamiento asíncrono. Se genera un registro de auditoría para el
+        evento `ORDER_CREATED`.
+      tags:
+        - Órdenes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            example:
+              customerId: 'cliente-123'
+              amount: 199.99
+              currency: 'PEN'
+      responses:
+        '201':
+          description: Orden creada exitosamente
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/Order'
+        '400':
+          description: Error de validación — campos requeridos ausentes o moneda no soportada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: No autorizado — token Bearer ausente o inválido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /orders/{id}:
+    get:
+      summary: Consultar una orden por ID
+      description: |
+        Retorna la orden con su historial completo de auditoría (cambios de estado).
+      tags:
+        - Órdenes
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: UUID de la orden
+          example: '550e8400-e29b-41d4-a716-446655440000'
+      responses:
+        '200':
+          description: Orden encontrada
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        $ref: '#/components/schemas/OrderWithAudit'
+        '401':
+          description: No autorizado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Orden no encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /orders/{id}/process:
+    post:
+      summary: Procesar una orden manualmente
+      description: |
+        Dispara el procesamiento de una orden en estado `PENDING`.
+
+        Máquina de estados: `PENDING → PROCESSING → COMPLETED | FAILED`
+
+        - Si la orden no está en `PENDING`, retorna 409 Conflicto.
+        - El procesamiento tiene una tasa de fallo simulada (~10%) para demostrar el manejo de errores.
+        - Cada transición genera un registro de auditoría.
+
+        En producción, este flujo es disparado automáticamente por el consumidor SQS (Lambda).
+        Este endpoint existe para disparado manual y pruebas.
+      tags:
+        - Órdenes
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: UUID de la orden
+      responses:
+        '202':
+          description: Procesamiento completado
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          mensaje:
+                            type: string
+                            example: 'Procesamiento de orden completado'
+        '401':
+          description: No autorizado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Orden no encontrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Transición de estado inválida (la orden no está en estado PENDING)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /health:
+    get:
+      summary: Health check
+      description: Retorna 200 si el servicio está en línea.
+      tags:
+        - Sistema
+      security: []
+      responses:
+        '200':
+          description: Servicio operativo
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: 'ok'
