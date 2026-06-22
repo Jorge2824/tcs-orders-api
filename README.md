@@ -11,9 +11,9 @@ Plataforma de procesamiento de órdenes para comercios digitales — Prueba Téc
 Se eligió DynamoDB sobre una base de datos relacional porque:
 
 - **Los patrones de acceso son clave-valor**: toda lectura y escritura es por `orderId` (PK). No se necesitan JOINs.
-- **La auditoría es append-only**: una tabla DynamoDB con `orderId` (PK) + `timestamp` (SK) entrega historial ordenado por orden — es el modelo natural para event sourcing.
+- **La auditoría es append-only**: una tabla DynamoDB con `orderId` (PK) + `timestamp` (SK) entrega historial ordenado — es el modelo natural para event sourcing.
 - **Nativo de AWS sin servidor**: escala automáticamente junto a Lambda sin gestión de conexiones.
-- **SQL tendría sentido** si se necesitaran consultas complejas (ej: "órdenes de un cliente en un rango de fechas"), reportes o transacciones entre múltiples entidades. En este caso agregaría complejidad operacional innecesaria.
+- **SQL tendría sentido** si se necesitaran consultas complejas, reportes o transacciones entre múltiples entidades. En este caso agregaría complejidad operacional innecesaria.
 
 ### Cómputo: Lambda + API Gateway
 
@@ -21,20 +21,20 @@ Se eligió Lambda sobre ECS Fargate porque:
 
 - **Operaciones sin estado y de corta duración**: cada endpoint ejecuta en milisegundos. Lambda cobra por invocación — ideal para este patrón.
 - **Integración nativa con SQS**: el mapeo de fuente de eventos SQS → Lambda no requiere polling.
-- **ECS Fargate es mejor cuando**: el workload es CPU-intensivo, requiere estado en memoria persistente, corre por minutos de forma continua, o tiene dependencias complejas de contenedor.
+- **Mismo código local y en AWS**: la app Express se envuelve con `serverless-http` para Lambda. No hay adaptadores duplicados.
 
 ### Procesamiento asíncrono: SQS
 
-Al crear una orden, su ID se encola en SQS. La Lambda `sqs-processor` consume la cola y ejecuta la transición completa `PENDING → PROCESSING → COMPLETED/FAILED`.
+Al crear una orden, su ID se encola en SQS. La Lambda `sqs-processor` consume la cola y ejecuta la transición completa `PENDING → PROCESSING → COMPLETED/FAILED` de forma automática.
 
 Esto garantiza:
-- `POST /orders` responde rápido (fire-and-forget).
+- `POST /orders` responde en milisegundos (fire-and-forget).
 - Los fallos de procesamiento se reintentan automáticamente (hasta 3 veces) antes de ir a la Cola de Mensajes Fallidos (DLQ).
 - El sistema es resiliente ante picos de carga.
 
 ### IaC: AWS CDK (TypeScript)
 
-CDK comparte el mismo lenguaje que la aplicación, manteniendo todo el stack en un repositorio. Provee definiciones de recursos type-safe y es más expresivo que CloudFormation o Serverless Framework YAML.
+CDK comparte el mismo lenguaje que la aplicación, manteniendo todo el stack en un repositorio. Provee definiciones de recursos type-safe y es más expresivo que CloudFormation YAML puro.
 
 ### Arquitectura Hexagonal (Puertos y Adaptadores)
 
@@ -43,69 +43,69 @@ src/
 ├── domain/          # Entidades, Puertos (interfaces), Excepciones de dominio
 ├── application/     # Casos de uso, DTOs de aplicación
 ├── infrastructure/  # Adaptadores: DynamoDB, SQS, HTTP (Express), Lambda
-└── shared/          # Constantes, Utilidades, Excepciones compartidas
+└── shared/          # Constantes (enums), Utilidades, Excepciones compartidas
 ```
 
 El dominio **no tiene dependencias de AWS ni Express**. Los adaptadores implementan las interfaces de los puertos. Los casos de uso reciben sus dependencias por inyección — completamente testeables en aislamiento.
 
-**Middlewares por adaptador:**
-- `auth.middleware.ts` → adaptador HTTP (Express). Usa `auth.util.ts` para la comparación del token.
-- `lambda-auth.util.ts` → adaptador Lambda. Usa la misma `auth.util.ts`.
-- Procesador SQS → sin autenticación (IAM controla el acceso al servicio).
+### Estados de la orden
 
-La lógica real de validación del token vive una sola vez en `shared/utils/auth.util.ts`.
-
-### Máquina de estados
+Los estados se almacenan como valores numéricos en DynamoDB para evitar strings mágicos. En código se usan enums TypeScript:
 
 ```
-PENDING ──► PROCESSING ──► COMPLETED
-                       └──► FAILED
+OrderStatus.PENDING (1) ──► OrderStatus.PROCESSING (2) ──► OrderStatus.COMPLETED (3)
+                                                       └──► OrderStatus.FAILED (4)
 ```
 
-Definida en `VALID_TRANSITIONS` (constantes) y protegida en `ProcessOrderUseCase`. Las transiciones inválidas lanzan `InvalidOrderTransitionException` → HTTP 409.
+Definido en `VALID_TRANSITIONS` y protegido en `ProcessOrderUseCase`. Las transiciones inválidas lanzan `InvalidOrderTransitionException` → HTTP 409.
+
+### Versionado de API
+
+El prefijo `/v1` vive en el **stage de API Gateway**, no en las rutas de Express. Si en el futuro se necesita una versión `/v2`, se crea un nuevo stage apuntando a otro Lambda — Express no sabe nada de versiones.
 
 ---
 
 ## Escenario AWS
 
 ```
-                     ┌─────────────────────────────────────┐
-Cliente              │          API Gateway                 │
-  │  POST /orders    │  (REST API, rutas por Lambda)        │
-  ├────────────────► │                                      │
-  │  GET /orders/:id │  ┌────────────┐  ┌───────────────┐  │
-  ├────────────────► │  │  Crear     │  │  Consultar    │  │
-  │  POST /:id/proc  │  │  Orden     │  │  Orden        │  │
-  └────────────────► │  │  Lambda    │  │  Lambda       │  │
-                     │  └─────┬──────┘  └───────┬───────┘  │
-                     └────────┼──────────────────┼──────────┘
-                              │                  │
-                     Encolar  │           Leer   │
-                              ▼                  ▼
-                           ┌──────┐         ┌──────────┐
-                           │ SQS  │         │ DynamoDB │
-                           │ Cola │         │          │
-                           └──┬───┘         │ orders   │
-                              │             │ audit_   │
-                     Trigger  │             │ logs     │
-                              ▼             └──────────┘
-                      ┌─────────────┐
-                      │ Procesador  │
-                      │ SQS Lambda  │ ──► DynamoDB (actualizar)
-                      └─────────────┘
+                     ┌──────────────────────────────────────┐
+Cliente              │          API Gateway  (stage: v1)     │
+  │  POST /orders    │                                       │
+  ├────────────────► │                                       │
+  │  GET /orders/:id │         ┌──────────────────┐          │
+  ├────────────────► │         │   OrdersApiFn    │          │
+  │  POST /:id/proc  │         │ (Express via     │          │
+  └────────────────► │         │  serverless-http)│          │
+                     │         └────────┬─────────┘          │
+                     └──────────────────┼────────────────────┘
+                                        │
+                          ┌─────────────┼─────────────┐
+                          │             │              │
+                       Escribir      Leer/         Encolar
+                       auditoría    actualizar    orderId
+                          │             │              │
+                          ▼             ▼              ▼
+                     ┌──────────┐  ┌──────────┐  ┌──────────┐
+                     │ DynamoDB │  │ DynamoDB │  │   SQS    │
+                     │audit_logs│  │  orders  │  │  Queue   │
+                     └──────────┘  └──────────┘  └────┬─────┘
+                                                       │ Trigger
+                                                       ▼
+                                               ┌──────────────┐
+                                               │SqsProcessorFn│
+                                               │(auto-procesa │
+                                               │  la orden)   │
+                                               └──────────────┘
 ```
 
-**Decisiones clave para AWS:**
+**Flujo completo al crear una orden:**
 
-| Pregunta | Decisión | Razón |
-|---|---|---|
-| Lambda vs ECS | Lambda | Sin estado, corta duración, pago por invocación |
-| Tipo de API Gateway | REST API | Integración Lambda por ruta; HTTP API también funciona |
-| DLQ | Sí, 3 reintentos | Resiliencia ante fallos transitorios de procesamiento |
-| PITR en tabla órdenes | Habilitado | Recuperación puntual para datos de producción |
-| IAM para Lambda | Mínimo privilegio | Cada función solo recibe los permisos que necesita |
+1. `POST /v1/orders` → Lambda recibe el request a través de API Gateway
+2. Express ejecuta `CreateOrderUseCase`: persiste la orden en DynamoDB con `status: 1 (PENDING)` y registra auditoría `ORDER_CREATED`
+3. El `orderId` se encola en SQS — el cliente recibe respuesta `201` inmediatamente
+4. En paralelo, `SqsProcessorFn` se dispara automáticamente: ejecuta `PENDING → PROCESSING → COMPLETED` (o `FAILED`) y registra cada transición en la tabla de auditoría
 
-**Escalabilidad:** Lambda + DynamoDB escalan a millones de órdenes sin cambios de configuración. Para alto throughput, el batch size de SQS puede aumentarse y la concurrencia de Lambda puede reservarse.
+**Al consultar la orden después:** el estado ya refleja el resultado del procesamiento asíncrono.
 
 ---
 
@@ -128,13 +128,13 @@ Esto inicia:
 2. **ElasticMQ** — emulador SQS open-source, la cola `orders-queue` se configura vía `docker/elasticmq.conf`
 3. **tcs-orders-api** — servidor Express en el puerto 3000
 
-> **Nota:** Se usa ElasticMQ en lugar de LocalStack porque la versión `latest` de LocalStack pasó a requerir licencia pro. ElasticMQ es 100% open-source, sin registro ni cuenta.
+> **Nota:** Se usa ElasticMQ en lugar de LocalStack porque la versión `latest` de LocalStack requiere licencia pro. ElasticMQ es 100% open-source, sin registro ni cuenta.
 
 ### Acceso
 
 | Recurso | URL |
 |---|---|
-| API | `http://localhost:3000/api/v1` |
+| API | `http://localhost:3000` |
 | Swagger UI | `http://localhost:3000/api-docs` |
 | Health check | `http://localhost:3000/health` |
 
@@ -146,14 +146,14 @@ docker compose down
 
 ---
 
-## Uso de la API
+## Uso de la API — Entorno local
 
 Todos los endpoints requieren `Authorization: Bearer dev-secret-token` (configurable con la variable de entorno `BEARER_TOKEN`).
 
 ### Crear una orden
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/orders \
+curl -X POST http://localhost:3000/orders \
   -H "Authorization: Bearer dev-secret-token" \
   -H "Content-Type: application/json" \
   -d '{"customerId": "cliente-123", "amount": 199.99, "currency": "USD"}'
@@ -164,34 +164,71 @@ Respuesta `201`:
 {
   "success": true,
   "data": {
-    "id": "550e8400-...",
+    "id": "550e8400-e29b-41d4-a716-446655440000",
     "customerId": "cliente-123",
     "amount": 199.99,
     "currency": "USD",
-    "status": "PENDING",
+    "status": 1,
     "createdAt": "2026-01-01T00:00:00.000Z",
     "updatedAt": "2026-01-01T00:00:00.000Z"
   }
 }
 ```
 
+> `status: 1` = PENDING. En local (Docker) el procesamiento SQS no se dispara automáticamente; usar el endpoint de procesar para ejecutarlo manualmente.
+
 ### Consultar una orden
 
 ```bash
-curl http://localhost:3000/api/v1/orders/{id} \
+curl http://localhost:3000/orders/{id} \
   -H "Authorization: Bearer dev-secret-token"
 ```
 
-Respuesta `200` — incluye la orden y el historial completo de auditoría (cambios de estado).
+Respuesta `200`:
+```json
+{
+  "success": true,
+  "data": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "customerId": "cliente-123",
+    "amount": 199.99,
+    "currency": "USD",
+    "status": 3,
+    "createdAt": "2026-01-01T00:00:00.000Z",
+    "updatedAt": "2026-01-01T00:00:00.001Z",
+    "auditLogs": [
+      { "event": 1, "previousStatus": null, "newStatus": 1, "timestamp": "..." },
+      { "event": 2, "previousStatus": 1,    "newStatus": 2, "timestamp": "..." },
+      { "event": 3, "previousStatus": 2,    "newStatus": 3, "timestamp": "..." }
+    ]
+  }
+}
+```
 
 ### Procesar una orden manualmente
 
 ```bash
-curl -X POST http://localhost:3000/api/v1/orders/{id}/process \
+curl -X POST http://localhost:3000/orders/{id}/process \
   -H "Authorization: Bearer dev-secret-token"
 ```
 
-Respuesta `202` — la orden transiciona por `PENDING → PROCESSING → COMPLETED` (o `FAILED` con ~10% de probabilidad para simular errores).
+Respuesta `202`: la orden transiciona `PENDING → PROCESSING → COMPLETED` (o `FAILED` con ~10% de probabilidad para simular errores reales).
+
+### Referencia de estados
+
+| Valor numérico | Nombre | Descripción |
+|---|---|---|
+| `1` | PENDING | Orden registrada, en espera de procesamiento |
+| `2` | PROCESSING | En proceso de aprobación |
+| `3` | COMPLETED | Orden aprobada y completada |
+| `4` | FAILED | Procesamiento fallido |
+
+### Monedas soportadas
+
+| Valor | Descripción |
+|---|---|
+| `PEN` | Soles peruanos |
+| `USD` | Dólares americanos |
 
 ### Códigos HTTP de respuesta
 
@@ -212,17 +249,118 @@ Respuesta `202` — la orden transiciona por `PENDING → PROCESSING → COMPLET
 
 ### Prerrequisitos
 
-- AWS CLI configurado (`aws configure`)
 - Node.js 20+
+- AWS CLI instalado
+
+### 1. Configurar credenciales AWS
+
+```bash
+aws configure --profile devsecops-admin
+# AWS Access Key ID: tu-access-key
+# AWS Secret Access Key: tu-secret-key
+# Default region name: us-east-1
+# Default output format: json
+```
+
+> Para verificar que las credenciales son correctas:
+> ```bash
+> aws sts get-caller-identity --profile devsecops-admin
+> ```
+
+### 2. Instalar dependencias del CDK
 
 ```bash
 cd infrastructure/cdk
 npm install
-npx cdk bootstrap          # Solo la primera vez por cuenta/región
-BEARER_TOKEN=tu-token-secreto npx cdk deploy
 ```
 
-CDK imprimirá la URL de API Gateway después del despliegue.
+### 3. Bootstrap (solo la primera vez por cuenta/región)
+
+```bash
+npx cdk bootstrap --profile devsecops-admin
+```
+
+Crea el bucket S3 y los roles IAM que CDK necesita para desplegar assets en tu cuenta.
+
+### 4. Desplegar
+
+```bash
+npx cdk deploy --profile devsecops-admin
+```
+
+Para un token personalizado en producción:
+
+```bash
+BEARER_TOKEN=mi-token-secreto npx cdk deploy --profile devsecops-admin
+```
+
+CDK imprimirá al finalizar:
+
+```
+Outputs:
+TcsOrdersStack.ApiGatewayUrl = https://{api-id}.execute-api.us-east-1.amazonaws.com/v1/
+TcsOrdersStack.OrdersQueueUrl = https://sqs.us-east-1.amazonaws.com/{account}/orders-queue
+```
+
+---
+
+## Uso de la API — Entorno AWS desplegado
+
+Base URL: `https://uh6lewjj66.execute-api.us-east-1.amazonaws.com/v1`
+
+### Crear una orden
+
+```bash
+curl -X POST https://uh6lewjj66.execute-api.us-east-1.amazonaws.com/v1/orders \
+  -H "Authorization: Bearer dev-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"customerId": "cliente-123", "amount": 199.99, "currency": "USD"}'
+```
+
+### Consultar una orden
+
+```bash
+curl https://uh6lewjj66.execute-api.us-east-1.amazonaws.com/v1/orders/6f2f89bc-f7da-4052-bce3-92826d587f26 \
+  -H "Authorization: Bearer dev-secret-token"
+```
+
+Respuesta real obtenida tras el despliegue:
+```json
+{
+  "success": true,
+  "data": {
+    "id": "6f2f89bc-f7da-4052-bce3-92826d587f26",
+    "customerId": "customer-123",
+    "amount": 199.99,
+    "currency": "USD",
+    "status": 3,
+    "createdAt": "2026-06-22T08:19:49.171Z",
+    "updatedAt": "2026-06-22T08:19:49.882Z",
+    "auditLogs": [
+      { "event": 1, "previousStatus": null, "newStatus": 1, "timestamp": "2026-06-22T08:19:49.171Z" },
+      { "event": 2, "previousStatus": 1,    "newStatus": 2, "timestamp": "2026-06-22T08:19:49.642Z" },
+      { "event": 3, "previousStatus": 2,    "newStatus": 3, "timestamp": "2026-06-22T08:19:49.882Z" }
+    ]
+  }
+}
+```
+
+> **Por qué la orden ya aparece en `COMPLETED` al consultarla:** al crear la orden, su ID se encola en SQS. La Lambda `SqsProcessorFn` se dispara automáticamente en milisegundos y ejecuta todo el ciclo de vida `PENDING → PROCESSING → COMPLETED`. El cliente recibe el `201` de forma inmediata (fire-and-forget) y el procesamiento ocurre en paralelo.
+
+### Procesar una orden manualmente
+
+```bash
+curl -X POST https://uh6lewjj66.execute-api.us-east-1.amazonaws.com/v1/orders/{id}/process \
+  -H "Authorization: Bearer dev-secret-token"
+```
+
+> En AWS este endpoint es redundante porque el procesamiento ya ocurrió vía SQS. Es útil para reprocessar órdenes en estado `FAILED` o para pruebas puntuales.
+
+### Health check
+
+```bash
+curl https://uh6lewjj66.execute-api.us-east-1.amazonaws.com/v1/health
+```
 
 ---
 
@@ -236,6 +374,5 @@ CDK imprimirá la URL de API Gateway después del despliegue.
 | Pruebas | Tests unitarios para casos de uso (repositorios en memoria), tests de integración con DynamoDB Local |
 | CI/CD | GitHub Actions: lint → test → build → cdk deploy |
 | DynamoDB | Agregar GSI en `customerId` para consulta "listar órdenes por cliente" |
-| Versionado de API | Prefijo de versión manejado por variables de stage de API Gateway |
 | Seguridad | API Gateway usage plans + WAF para protección DDoS |
 | Secretos | Almacenar `BEARER_TOKEN` en AWS Secrets Manager, inyectado en Lambda vía env al desplegar |

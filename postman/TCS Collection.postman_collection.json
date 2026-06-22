@@ -1,0 +1,122 @@
+{
+  "info": {
+    "_postman_id": "7be11fa7-28b0-4575-87fb-07e961f34484",
+    "name": "TCS Collection",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "26382186",
+    "_collection_link": "https://go.postman.co/collection/26382186-7be11fa7-28b0-4575-87fb-07e961f34484?source=collection_link"
+  },
+  "item": [
+    {
+      "name": "Create Orders",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n  \"customerId\": \"customer-123\",\r\n  \"amount\": 199.99,\r\n  \"currency\": \"USD\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{pathUrl}}/v1/orders",
+          "host": [
+            "{{pathUrl}}"
+          ],
+          "path": [
+            "v1",
+            "orders"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Get Order by ID",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{pathUrl}}/v1/orders/{{uuidOrder}}",
+          "host": [
+            "{{pathUrl}}"
+          ],
+          "path": [
+            "v1",
+            "orders",
+            "{{uuidOrder}}"
+          ]
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "Process order",
+      "request": {
+        "auth": {
+          "type": "bearer",
+          "bearer": [
+            {
+              "key": "token",
+              "value": "{{bearerToken}}",
+              "type": "string"
+            }
+          ]
+        },
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "raw",
+          "raw": "{\r\n  \"customerId\": \"customer-123\",\r\n  \"amount\": 199.99,\r\n  \"currency\": \"USD\"\r\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{pathUrl}}/v1/orders/{{uuidOrder}}/process",
+          "host": [
+            "{{pathUrl}}"
+          ],
+          "path": [
+            "v1",
+            "orders",
+            "{{uuidOrder}}",
+            "process"
+          ]
+        }
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "auth_secret_0m82",
+      "secret": true
+    }
+  ]
+}
